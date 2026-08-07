@@ -1,0 +1,2320 @@
+//+------------------------------------------------------------------+
+//|                                           T100_Trend_Rider_v5.mq4|
+//|                         T100 Trend Rider - Version 5.10          |
+//|                         Multi-timeframe MT4 EA                   |
+//|                         Copyright 2026 Rupert                    |
+//+------------------------------------------------------------------+
+#property strict
+#property version "5.10"
+#property description "T100 Trend Rider v5.10 - H4 primary trend, pullback then M1 EMA cross"
+
+//==================================================================
+// INPUTS
+//==================================================================
+
+input int      FastEMA              = 20;
+input int      SlowEMA              = 50;
+
+input int      RSIPeriod            = 14;
+input double   BullRSI              = 55.0;
+input double   BearRSI              = 45.0;
+
+input int      ATRPeriod            = 14;
+input double   MinATRPoints         = 0.0;      // 0 = disabled
+
+input int      ADXPeriod            = 14;
+input double   MinADX               = 20.0;
+
+input long     MinVolume            = 100;
+input int      MaxSpread            = 50;
+
+// Trading-hours filter.
+// OFF by default so Strategy Tester can test all historical data.
+input bool     UseTradingHours      = false;
+input int      TradingStartHour     = 8;
+input int      TradingEndHour       = 18;
+
+// Entry scoring
+input int      MinimumTradeScore    = 60;
+input double   MinEMADistancePoints = 2.0;
+input double   PullbackATRMax       = 1.50;
+input bool     RequirePullback      = true;
+
+// Pullback must be followed by an M1 EMA20/EMA50 cross.
+// A pullback remains valid for this many completed M1 bars.
+input int      PullbackMaxBars        = 3;
+
+// Risk / trade limits
+input double   RiskPercent          = 1.0;
+input double   MaxDailyLossPercent  = 3.0;
+input int      MaxTradesPerDay      = 5;
+input int      MagicNumber          = 1001;
+
+// Stops
+input double   ATR_SL_Multiplier    = 2.0;
+input double   ATR_TP_Multiplier    = 3.0;
+input int      MinimumSLPoints      = 100;
+input int      MinimumTPPoints      = 150;
+
+// Trade management
+input bool     UseBreakEven         = true;
+input double   BreakEvenATR         = 1.0;
+input double   BreakEvenPlusPoints  = 2.0;
+
+input bool     UseTrailingStop      = true;
+input double   TrailingATR          = 1.5;
+
+input bool     DebugMode            = true;
+
+
+//==================================================================
+// GLOBALS
+//==================================================================
+
+datetime LastBar = 0;
+
+int      TradeDay = -1;
+int      TradesToday = 0;
+
+double   DayStartBalance = 0.0;
+
+bool IndicatorsReady = false;
+bool TradingHoursOK  = true;
+bool SpreadOK        = false;
+
+
+//------------------------------------------------------------------
+// Cached indicators
+//------------------------------------------------------------------
+
+double EMA20_H4  = 0;
+double EMA50_H4  = 0;
+
+double EMA20_H1  = 0;
+double EMA50_H1  = 0;
+
+double EMA20_M15 = 0;
+double EMA50_M15 = 0;
+
+double EMA20_M5  = 0;
+double EMA50_M5  = 0;
+
+double EMA20_M1  = 0;
+double EMA50_M1  = 0;
+
+double RSI_M15   = 0;
+double ATR_M15   = 0;
+double ADX_M15   = 0;
+
+double CurrentSpread = 0;
+
+long Volume_M15 = 0;
+
+
+//------------------------------------------------------------------
+// Direction / scoring
+//------------------------------------------------------------------
+
+double TrendScore = 0;
+double EntryScore = 0;
+
+bool IsH4Bull  = false;
+bool IsH4Bear  = false;
+
+bool IsH1Bull  = false;
+bool IsH1Bear  = false;
+
+bool IsM15Bull = false;
+bool IsM15Bear = false;
+
+bool IsM5Bull  = false;
+bool IsM5Bear  = false;
+
+bool IsM1Bull  = false;
+bool IsM1Bear  = false;
+
+// Pullback -> EMA cross state.
+// 0 = not armed, 1..PullbackMaxBars = valid pullback age.
+int BullPullbackAge = 0;
+int BearPullbackAge = 0;
+
+
+//==================================================================
+// INITIALIZATION
+//==================================================================
+
+int OnInit()
+{
+   LastBar = 0;
+
+   BullPullbackAge = 0;
+   BearPullbackAge = 0;
+
+   ResetDailyCounters();
+
+   Print("====================================================");
+   Print("T100 Trend Rider v5.10 STARTED");
+   Print("Symbol: ", Symbol(), "  Period: ", Period());
+   Print("Trading hours filter: ", UseTradingHours);
+   Print("Minimum trade score: ", MinimumTradeScore);
+   Print("Risk: ", DoubleToString(RiskPercent,2), "%");
+   Print("====================================================");
+
+   return(INIT_SUCCEEDED);
+}
+
+
+//==================================================================
+// DEINITIALIZATION
+//==================================================================
+
+void OnDeinit(const int reason)
+{
+   Comment("");
+
+   Print("T100 Trend Rider v5.10 stopped.");
+}
+
+
+//==================================================================
+// MAIN LOOP
+//==================================================================
+
+void OnTick()
+{
+   // Always manage an existing trade.
+   ManageOpenTrades();
+
+   // Entry calculations only happen once per new M1 bar.
+   if(!IsNewBar())
+      return;
+
+   UpdateDailyCounters();
+
+   if(Bars < SlowEMA + 10)
+   {
+      if(DebugMode)
+         Print("BLOCKED: not enough M1 bars");
+
+      return;
+   }
+
+   UpdateIndicators();
+
+   CheckTradingHours();
+
+   CheckSpread();
+
+   if(DebugMode)
+      PrintStatus();
+
+   if(!MarketReady())
+      return;
+
+   CalculateTrend();
+
+   UpdatePullbackState();
+
+   CalculateEntryScore();
+
+   if(DebugMode)
+   {
+      Print(
+         "TrendScore=",
+         DoubleToString(TrendScore,0),
+         " EntryScore=",
+         DoubleToString(EntryScore,0),
+         " M1Bull=",
+         IsM1Bull,
+         " M1Bear=",
+         IsM1Bear
+      );
+   }
+
+   if(EntryReady())
+   {
+      OpenTrade();
+   }
+   else
+   {
+      if(DebugMode)
+         Print("ENTRY NOT READY");
+   }
+}
+
+
+//==================================================================
+// NEW BAR
+//==================================================================
+
+bool IsNewBar()
+{
+   datetime barTime = iTime(Symbol(), PERIOD_M1, 0);
+
+   if(barTime <= 0)
+      return(false);
+
+   if(barTime != LastBar)
+   {
+      LastBar = barTime;
+      return(true);
+   }
+
+   return(false);
+}
+
+
+//==================================================================
+// UPDATE INDICATORS
+//==================================================================
+
+void UpdateIndicators()
+{
+   // Make sure every timeframe has enough history before accepting
+   // indicator values as valid.
+   IndicatorsReady =
+      (
+         iBars(Symbol(), PERIOD_H4)  >= SlowEMA + 10 &&
+         iBars(Symbol(), PERIOD_H1)  >= SlowEMA + 10 &&
+         iBars(Symbol(), PERIOD_M15) >= SlowEMA + 10 &&
+         iBars(Symbol(), PERIOD_M5)  >= SlowEMA + 10 &&
+         iBars(Symbol(), PERIOD_M1)  >= SlowEMA + 10
+      );
+
+   if(!IndicatorsReady)
+      return;
+
+   EMA20_H4 =
+      iMA(Symbol(), PERIOD_H4, FastEMA, 0,
+          MODE_EMA, PRICE_CLOSE, 1);
+
+   EMA50_H4 =
+      iMA(Symbol(), PERIOD_H4, SlowEMA, 0,
+          MODE_EMA, PRICE_CLOSE, 1);
+
+
+   EMA20_H1 =
+      iMA(Symbol(), PERIOD_H1, FastEMA, 0,
+          MODE_EMA, PRICE_CLOSE, 1);
+
+   EMA50_H1 =
+      iMA(Symbol(), PERIOD_H1, SlowEMA, 0,
+          MODE_EMA, PRICE_CLOSE, 1);
+
+
+   EMA20_M15 =
+      iMA(Symbol(), PERIOD_M15, FastEMA, 0,
+          MODE_EMA, PRICE_CLOSE, 1);
+
+   EMA50_M15 =
+      iMA(Symbol(), PERIOD_M15, SlowEMA, 0,
+          MODE_EMA, PRICE_CLOSE, 1);
+
+
+   EMA20_M5 =
+      iMA(Symbol(), PERIOD_M5, FastEMA, 0,
+          MODE_EMA, PRICE_CLOSE, 1);
+
+   EMA50_M5 =
+      iMA(Symbol(), PERIOD_M5, SlowEMA, 0,
+          MODE_EMA, PRICE_CLOSE, 1);
+
+
+   EMA20_M1 =
+      iMA(Symbol(), PERIOD_M1, FastEMA, 0,
+          MODE_EMA, PRICE_CLOSE, 1);
+
+   EMA50_M1 =
+      iMA(Symbol(), PERIOD_M1, SlowEMA, 0,
+          MODE_EMA, PRICE_CLOSE, 1);
+
+
+   RSI_M15 =
+      iRSI(Symbol(), PERIOD_M15,
+           RSIPeriod, PRICE_CLOSE, 1);
+
+
+   ATR_M15 =
+      iATR(Symbol(), PERIOD_M15,
+           ATRPeriod, 1);
+
+
+   ADX_M15 =
+      iADX(Symbol(), PERIOD_M15,
+           ADXPeriod,
+           PRICE_CLOSE,
+           MODE_MAIN,
+           1);
+
+
+   Volume_M15 =
+      iVolume(Symbol(), PERIOD_M15, 1);
+
+
+   CurrentSpread =
+      MarketInfo(Symbol(), MODE_SPREAD);
+
+
+   IndicatorsReady = true;
+
+
+   if(
+      EMA20_H4 <= 0 ||
+      EMA50_H4 <= 0 ||
+
+      EMA20_H1 <= 0 ||
+      EMA50_H1 <= 0 ||
+
+      EMA20_M15 <= 0 ||
+      EMA50_M15 <= 0 ||
+
+      EMA20_M5 <= 0 ||
+      EMA50_M5 <= 0 ||
+
+      EMA20_M1 <= 0 ||
+      EMA50_M1 <= 0 ||
+
+      RSI_M15 <= 0 ||
+      ATR_M15 <= 0 ||
+      ADX_M15 <= 0 ||
+
+      Volume_M15 <= 0
+   )
+   {
+      IndicatorsReady = false;
+   }
+}
+
+
+//==================================================================
+// TRADING HOURS
+//==================================================================
+
+void CheckTradingHours()
+{
+   // Disabled = always allowed.
+   if(!UseTradingHours)
+   {
+      TradingHoursOK = true;
+      return;
+   }
+
+
+   int h = TimeHour(TimeCurrent());
+
+
+   // Same start/end = 24 hours.
+   if(TradingStartHour == TradingEndHour)
+   {
+      TradingHoursOK = true;
+      return;
+   }
+
+
+   // Normal session, e.g. 08 -> 18.
+   if(TradingStartHour < TradingEndHour)
+   {
+      TradingHoursOK =
+         (h >= TradingStartHour &&
+          h < TradingEndHour);
+
+      return;
+   }
+
+
+   // Overnight session, e.g. 22 -> 06.
+   TradingHoursOK =
+      (h >= TradingStartHour ||
+       h < TradingEndHour);
+}
+
+
+//==================================================================
+// SPREAD
+//==================================================================
+
+void CheckSpread()
+{
+   CurrentSpread =
+      MarketInfo(Symbol(), MODE_SPREAD);
+
+   SpreadOK =
+      (
+         CurrentSpread >= 0 &&
+         CurrentSpread <= MaxSpread
+      );
+}
+
+
+//==================================================================
+// ATR FILTER
+//==================================================================
+
+bool ATR_OK()
+{
+   // 0 disables ATR minimum filter.
+   if(MinATRPoints <= 0.0)
+      return(true);
+
+   double atrPoints =
+      ATR_M15 / Point;
+
+   return(atrPoints >= MinATRPoints);
+}
+
+
+//==================================================================
+// VOLUME FILTER
+//==================================================================
+
+bool Volume_OK()
+{
+   if(MinVolume <= 0)
+      return(true);
+
+   return(Volume_M15 >= MinVolume);
+}
+
+
+//==================================================================
+// ADX FILTER
+//==================================================================
+
+bool ADX_OK()
+{
+   if(MinADX <= 0.0)
+      return(true);
+
+   return(ADX_M15 >= MinADX);
+}
+
+
+//==================================================================
+// DAILY RISK
+//==================================================================
+
+bool DailyRiskOK()
+{
+   if(MaxDailyLossPercent <= 0.0)
+      return(true);
+
+   if(DayStartBalance <= 0.0)
+      return(true);
+
+
+   double equityLoss =
+      DayStartBalance - AccountEquity();
+
+
+   double lossPercent =
+      100.0 *
+      equityLoss /
+      DayStartBalance;
+
+
+   return(lossPercent < MaxDailyLossPercent);
+}
+
+
+//==================================================================
+// MARKET READY
+//==================================================================
+
+bool MarketReady()
+{
+   if(!IndicatorsReady)
+   {
+      if(DebugMode)
+         Print("BLOCKED: IndicatorsReady = FALSE");
+
+      return(false);
+   }
+
+
+   if(!TradingHoursOK)
+   {
+      if(DebugMode)
+         Print("BLOCKED: TradingHoursOK = FALSE");
+
+      return(false);
+   }
+
+
+   if(!SpreadOK)
+   {
+      if(DebugMode)
+      {
+         Print(
+            "BLOCKED: SpreadOK = FALSE, spread=",
+            CurrentSpread,
+            " max=",
+            MaxSpread
+         );
+      }
+
+      return(false);
+   }
+
+
+   if(!ATR_OK())
+   {
+      if(DebugMode)
+      {
+         Print(
+            "BLOCKED: ATR filter, ATR points=",
+            DoubleToString(ATR_M15 / Point,1)
+         );
+      }
+
+      return(false);
+   }
+
+
+   if(!Volume_OK())
+   {
+      if(DebugMode)
+         Print(
+            "BLOCKED: Volume filter, volume=",
+            Volume_M15
+         );
+
+      return(false);
+   }
+
+
+   if(!ADX_OK())
+   {
+      if(DebugMode)
+         Print(
+            "BLOCKED: ADX filter, ADX=",
+            DoubleToString(ADX_M15,2)
+         );
+
+      return(false);
+   }
+
+
+   if(!DailyRiskOK())
+   {
+      if(DebugMode)
+         Print("BLOCKED: daily loss limit reached");
+
+      return(false);
+   }
+
+
+   if(
+      TradesToday >= MaxTradesPerDay &&
+      MaxTradesPerDay > 0
+   )
+   {
+      if(DebugMode)
+         Print(
+            "BLOCKED: MaxTradesPerDay reached: ",
+            TradesToday,
+            "/",
+            MaxTradesPerDay
+         );
+
+      return(false);
+   }
+
+
+   return(true);
+}
+
+
+//==================================================================
+// TREND CALCULATION
+//==================================================================
+
+void CalculateTrend()
+{
+   IsH4Bull =
+      EMA20_H4 > EMA50_H4;
+
+   IsH4Bear =
+      EMA20_H4 < EMA50_H4;
+
+
+   IsH1Bull =
+      EMA20_H1 > EMA50_H1;
+
+   IsH1Bear =
+      EMA20_H1 < EMA50_H1;
+
+
+   IsM15Bull =
+      EMA20_M15 > EMA50_M15;
+
+   IsM15Bear =
+      EMA20_M15 < EMA50_M15;
+
+
+   IsM5Bull =
+      EMA20_M5 > EMA50_M5;
+
+   IsM5Bear =
+      EMA20_M5 < EMA50_M5;
+
+
+   TrendScore = 0;
+
+
+   // H4 = 30 points.
+   if(IsH4Bull)
+      TrendScore += 30;
+
+   if(IsH4Bear)
+      TrendScore -= 30;
+
+
+   // H1 = 25 points.
+   if(IsH1Bull)
+      TrendScore += 25;
+
+   if(IsH1Bear)
+      TrendScore -= 25;
+
+
+   // M15 = 20 points.
+   if(IsM15Bull)
+      TrendScore += 20;
+
+   if(IsM15Bear)
+      TrendScore -= 20;
+
+
+   // M5 = 15 points.
+   if(IsM5Bull)
+      TrendScore += 15;
+
+   if(IsM5Bear)
+      TrendScore -= 15;
+}
+
+
+//==================================================================
+// MARKET DIRECTION
+//==================================================================
+
+bool MarketBullish()
+{
+   // H4 is the PRIMARY trend. All lower timeframes must agree.
+   return(
+      IsH4Bull &&
+      IsH1Bull &&
+      IsM15Bull &&
+      IsM5Bull
+   );
+}
+
+bool MarketBearish()
+{
+   // H4 is the PRIMARY trend. All lower timeframes must agree.
+   return(
+      IsH4Bear &&
+      IsH1Bear &&
+      IsM15Bear &&
+      IsM5Bear
+   );
+}
+
+
+//==================================================================
+// M1 CROSS
+//==================================================================
+
+bool BullCross()
+{
+   double fastPrev =
+      iMA(
+         Symbol(),
+         PERIOD_M1,
+         FastEMA,
+         0,
+         MODE_EMA,
+         PRICE_CLOSE,
+         2
+      );
+
+
+   double slowPrev =
+      iMA(
+         Symbol(),
+         PERIOD_M1,
+         SlowEMA,
+         0,
+         MODE_EMA,
+         PRICE_CLOSE,
+         2
+      );
+
+
+   double fastNow =
+      iMA(
+         Symbol(),
+         PERIOD_M1,
+         FastEMA,
+         0,
+         MODE_EMA,
+         PRICE_CLOSE,
+         1
+      );
+
+
+   double slowNow =
+      iMA(
+         Symbol(),
+         PERIOD_M1,
+         SlowEMA,
+         0,
+         MODE_EMA,
+         PRICE_CLOSE,
+         1
+      );
+
+
+   return(
+      fastPrev <= slowPrev &&
+      fastNow > slowNow
+   );
+}
+
+
+//==================================================================
+// M1 BEAR CROSS
+//==================================================================
+
+bool BearCross()
+{
+   double fastPrev =
+      iMA(
+         Symbol(),
+         PERIOD_M1,
+         FastEMA,
+         0,
+         MODE_EMA,
+         PRICE_CLOSE,
+         2
+      );
+
+
+   double slowPrev =
+      iMA(
+         Symbol(),
+         PERIOD_M1,
+         SlowEMA,
+         0,
+         MODE_EMA,
+         PRICE_CLOSE,
+         2
+      );
+
+
+   double fastNow =
+      iMA(
+         Symbol(),
+         PERIOD_M1,
+         FastEMA,
+         0,
+         MODE_EMA,
+         PRICE_CLOSE,
+         1
+      );
+
+
+   double slowNow =
+      iMA(
+         Symbol(),
+         PERIOD_M1,
+         SlowEMA,
+         0,
+         MODE_EMA,
+         PRICE_CLOSE,
+         1
+      );
+
+
+   return(
+      fastPrev >= slowPrev &&
+      fastNow < slowNow
+   );
+}
+
+
+//==================================================================
+// FIX 1 - BULL PULLBACK
+//==================================================================
+
+bool BullPullback()
+{
+   if(!MarketBullish())
+      return(false);
+
+
+   double ema =
+      EMA20_M1;
+
+
+   double atr =
+      iATR(
+         Symbol(),
+         PERIOD_M1,
+         ATRPeriod,
+         1
+      );
+
+
+   if(atr <= 0)
+      return(false);
+
+
+   double close1 =
+      iClose(Symbol(), PERIOD_M1, 1);
+
+
+   double low1 =
+      iLow(Symbol(), PERIOD_M1, 1);
+
+
+   bool touched =
+      (low1 <= ema);
+
+
+   bool closedAbove =
+      (close1 > ema);
+
+
+   bool reasonableDistance =
+      (
+         MathAbs(close1 - ema) <=
+         atr * PullbackATRMax
+      );
+
+
+   return(
+      touched &&
+      closedAbove &&
+      reasonableDistance
+   );
+}
+
+
+//==================================================================
+// FIX 1 - BEAR PULLBACK
+//==================================================================
+
+bool BearPullback()
+{
+   if(!MarketBearish())
+      return(false);
+
+
+   double ema =
+      EMA20_M1;
+
+
+   double atr =
+      iATR(
+         Symbol(),
+         PERIOD_M1,
+         ATRPeriod,
+         1
+      );
+
+
+   if(atr <= 0)
+      return(false);
+
+
+   double close1 =
+      iClose(Symbol(), PERIOD_M1, 1);
+
+
+   double high1 =
+      iHigh(Symbol(), PERIOD_M1, 1);
+
+
+   bool touched =
+      (high1 >= ema);
+
+
+   bool closedBelow =
+      (close1 < ema);
+
+
+   bool reasonableDistance =
+      (
+         MathAbs(close1 - ema) <=
+         atr * PullbackATRMax
+      );
+
+
+   return(
+      touched &&
+      closedBelow &&
+      reasonableDistance
+   );
+}
+
+
+//==================================================================
+// PULLBACK STATE
+//==================================================================
+//
+// Strategy sequence:
+// H4 primary trend
+// -> H1 confirmation
+// -> M15 confirmation
+// -> M5 confirmation
+// -> M1 pullback
+// -> M1 EMA20/EMA50 cross
+//
+// The pullback is "armed" first and remains valid for a limited
+// number of completed M1 bars. The EMA cross then becomes mandatory.
+//==================================================================
+
+void UpdatePullbackState()
+{
+   // Pullback states are only valid while the higher-timeframe
+   // market direction remains aligned.
+   if(!MarketBullish())
+      BullPullbackAge = 0;
+
+   if(!MarketBearish())
+      BearPullbackAge = 0;
+
+
+   // Detect a fresh pullback on the current closed M1 bar.
+   if(MarketBullish() && BullPullback())
+   {
+      BullPullbackAge = 1;
+      BearPullbackAge = 0;
+
+      if(DebugMode)
+         Print("PULLBACK ARMED: BUY, age=1");
+   }
+   else
+   if(BullPullbackAge > 0)
+   {
+      BullPullbackAge++;
+
+      if(
+         PullbackMaxBars <= 0 ||
+         BullPullbackAge > PullbackMaxBars
+      )
+      {
+         BullPullbackAge = 0;
+
+         if(DebugMode)
+            Print("PULLBACK EXPIRED: BUY");
+      }
+   }
+
+
+   if(MarketBearish() && BearPullback())
+   {
+      BearPullbackAge = 1;
+      BullPullbackAge = 0;
+
+      if(DebugMode)
+         Print("PULLBACK ARMED: SELL, age=1");
+   }
+   else
+   if(BearPullbackAge > 0)
+   {
+      BearPullbackAge++;
+
+      if(
+         PullbackMaxBars <= 0 ||
+         BearPullbackAge > PullbackMaxBars
+      )
+      {
+         BearPullbackAge = 0;
+
+         if(DebugMode)
+            Print("PULLBACK EXPIRED: SELL");
+      }
+   }
+}
+
+
+bool BullPullbackArmed()
+{
+   return(
+      MarketBullish() &&
+      BullPullbackAge > 0 &&
+      (
+         PullbackMaxBars <= 0 ||
+         BullPullbackAge <= PullbackMaxBars
+      )
+   );
+}
+
+
+bool BearPullbackArmed()
+{
+   return(
+      MarketBearish() &&
+      BearPullbackAge > 0 &&
+      (
+         PullbackMaxBars <= 0 ||
+         BearPullbackAge <= PullbackMaxBars
+      )
+   );
+}
+
+
+//==================================================================
+// MOMENTUM
+//==================================================================
+
+bool BullMomentum()
+{
+   double close1 =
+      iClose(Symbol(), PERIOD_M1, 1);
+
+   double close2 =
+      iClose(Symbol(), PERIOD_M1, 2);
+
+
+   return(
+      close1 > close2 &&
+      close1 > EMA20_M1
+   );
+}
+
+
+bool BearMomentum()
+{
+   double close1 =
+      iClose(Symbol(), PERIOD_M1, 1);
+
+   double close2 =
+      iClose(Symbol(), PERIOD_M1, 2);
+
+
+   return(
+      close1 < close2 &&
+      close1 < EMA20_M1
+   );
+}
+
+
+//==================================================================
+// FIX 2 - SIMPLE CANDLE FILTER
+//==================================================================
+
+bool BullCandleOK()
+{
+   double o =
+      iOpen(Symbol(), PERIOD_M1, 1);
+
+   double c =
+      iClose(Symbol(), PERIOD_M1, 1);
+
+   double previousClose =
+      iClose(Symbol(), PERIOD_M1, 2);
+
+
+   return(
+      c > o ||
+      c > previousClose
+   );
+}
+
+
+bool BearCandleOK()
+{
+   double o =
+      iOpen(Symbol(), PERIOD_M1, 1);
+
+   double c =
+      iClose(Symbol(), PERIOD_M1, 1);
+
+   double previousClose =
+      iClose(Symbol(), PERIOD_M1, 2);
+
+
+   return(
+      c < o ||
+      c < previousClose
+   );
+}
+
+
+//==================================================================
+// FIX 3 - EMA DISTANCE
+//==================================================================
+
+bool EMADistanceOK()
+{
+   double distancePoints =
+      MathAbs(
+         EMA20_M15 -
+         EMA50_M15
+      ) / Point;
+
+
+   return(
+      distancePoints >=
+      MinEMADistancePoints
+   );
+}
+
+
+//==================================================================
+// RSI
+//==================================================================
+
+bool RSIBullOK()
+{
+   return(
+      RSI_M15 >= BullRSI
+   );
+}
+
+
+bool RSIBearOK()
+{
+   return(
+      RSI_M15 <= BearRSI
+   );
+}
+
+
+//==================================================================
+// ENTRY SCORE
+//==================================================================
+
+void CalculateEntryScore()
+{
+   EntryScore = 0;
+
+   IsM1Bull = false;
+   IsM1Bear = false;
+
+
+   bool bull =
+      MarketBullish();
+
+   bool bear =
+      MarketBearish();
+
+
+   bool bullArmed =
+      BullPullbackArmed();
+
+   bool bearArmed =
+      BearPullbackArmed();
+
+
+   bool bullCross =
+      BullCross();
+
+   bool bearCross =
+      BearCross();
+
+
+   //===============================================================
+   // HIGHER-TIMEFRAME TREND
+   //===============================================================
+
+   // Because MarketBullish/MarketBearish now requires H4 + H1 +
+   // M15 + M5 agreement, this is the first hard direction filter.
+   if(bull)
+      EntryScore += 30;
+
+   if(bear)
+      EntryScore -= 30;
+
+
+   //===============================================================
+   // M15 CONFIRMATION
+   //===============================================================
+
+   if(bull && RSIBullOK())
+      EntryScore += 15;
+
+   if(bear && RSIBearOK())
+      EntryScore -= 15;
+
+
+   if(ADX_OK())
+   {
+      if(bull)
+         EntryScore += 10;
+
+      if(bear)
+         EntryScore -= 10;
+   }
+
+
+   if(EMADistanceOK())
+   {
+      if(bull)
+         EntryScore += 10;
+
+      if(bear)
+         EntryScore -= 10;
+   }
+
+
+   //===============================================================
+   // M1 PULLBACK
+   //===============================================================
+
+   // A pullback is now a required stage in the sequence.
+   if(bullArmed)
+      EntryScore += 20;
+
+   if(bearArmed)
+      EntryScore -= 20;
+
+
+   //===============================================================
+   // M1 EMA CROSS
+   //===============================================================
+
+   // The EMA20/EMA50 cross is MANDATORY.
+   // It is no longer optional scoring confirmation.
+   if(bullCross)
+      EntryScore += 10;
+
+   if(bearCross)
+      EntryScore -= 10;
+
+
+   //===============================================================
+   // M1 MOMENTUM
+   //===============================================================
+
+   if(bull && BullMomentum())
+      EntryScore += 8;
+
+   if(bear && BearMomentum())
+      EntryScore -= 8;
+
+
+   //===============================================================
+   // M1 CANDLE
+   //===============================================================
+
+   if(bull && BullCandleOK())
+      EntryScore += 7;
+
+   if(bear && BearCandleOK())
+      EntryScore -= 7;
+
+
+   //===============================================================
+   // FINAL ENTRY DIRECTION
+   //===============================================================
+
+   // Strict sequence:
+   // H4/H1/M15/M5 alignment
+   // + pullback armed
+   // + M1 EMA cross
+   // + score threshold
+   IsM1Bull =
+      (
+         bull &&
+         bullArmed &&
+         bullCross &&
+         EntryScore >= MinimumTradeScore
+      );
+
+
+   IsM1Bear =
+      (
+         bear &&
+         bearArmed &&
+         bearCross &&
+         EntryScore <= -MinimumTradeScore
+      );
+
+
+   // RequirePullback is retained as an input for backwards
+   // compatibility, but strict T100 v5.10 always requires the
+   // pullback stage.
+}
+
+
+//==================================================================
+// ENTRY READY
+//==================================================================
+
+bool EntryReady()
+{
+   if(PositionExists())
+      return(false);
+
+
+   if(!DailyRiskOK())
+      return(false);
+
+
+   if(
+      MaxTradesPerDay > 0 &&
+      TradesToday >= MaxTradesPerDay
+   )
+      return(false);
+
+
+   // Strict T100 sequence:
+   // H4 -> H1 -> M15 -> M5 -> M1 pullback -> M1 EMA cross.
+   if(IsM1Bull)
+   {
+      if(!MarketBullish())
+         return(false);
+
+      if(!BullPullbackArmed())
+         return(false);
+
+      if(!BullCross())
+         return(false);
+
+      if(EntryScore < MinimumTradeScore)
+         return(false);
+
+      return(true);
+   }
+
+
+   if(IsM1Bear)
+   {
+      if(!MarketBearish())
+         return(false);
+
+      if(!BearPullbackArmed())
+         return(false);
+
+      if(!BearCross())
+         return(false);
+
+      if(EntryScore > -MinimumTradeScore)
+         return(false);
+
+      return(true);
+   }
+
+
+   return(false);
+}
+
+
+//==================================================================
+// POSITION EXISTS
+//==================================================================
+
+bool PositionExists()
+{
+   for(
+      int i = OrdersTotal()-1;
+      i >= 0;
+      i--
+   )
+   {
+      if(
+         !OrderSelect(
+            i,
+            SELECT_BY_POS,
+            MODE_TRADES
+         )
+      )
+         continue;
+
+
+      if(
+         OrderSymbol() !=
+         Symbol()
+      )
+         continue;
+
+
+      if(
+         OrderMagicNumber() !=
+         MagicNumber
+      )
+         continue;
+
+
+      if(
+         OrderType() == OP_BUY ||
+         OrderType() == OP_SELL
+      )
+         return(true);
+   }
+
+
+   return(false);
+}
+
+
+//==================================================================
+// RISK-BASED LOT SIZE
+//==================================================================
+
+double CalculateLot(
+   double stopDistancePrice
+)
+{
+   if(RiskPercent <= 0.0)
+      return(
+         MarketInfo(
+            Symbol(),
+            MODE_MINLOT
+         )
+      );
+
+
+   double riskMoney =
+      AccountBalance() *
+      RiskPercent /
+      100.0;
+
+
+   double tickValue =
+      MarketInfo(
+         Symbol(),
+         MODE_TICKVALUE
+      );
+
+
+   double tickSize =
+      MarketInfo(
+         Symbol(),
+         MODE_TICKSIZE
+      );
+
+
+   if(
+      tickValue <= 0 ||
+      tickSize <= 0 ||
+      stopDistancePrice <= 0
+   )
+   {
+      return(
+         MarketInfo(
+            Symbol(),
+            MODE_MINLOT
+         )
+      );
+   }
+
+
+   double lossPerLot =
+      (
+         stopDistancePrice /
+         tickSize
+      ) *
+      tickValue;
+
+
+   if(lossPerLot <= 0)
+      return(
+         MarketInfo(
+            Symbol(),
+            MODE_MINLOT
+         )
+      );
+
+
+   double lots =
+      riskMoney /
+      lossPerLot;
+
+
+   double minLot =
+      MarketInfo(
+         Symbol(),
+         MODE_MINLOT
+      );
+
+
+   double maxLot =
+      MarketInfo(
+         Symbol(),
+         MODE_MAXLOT
+      );
+
+
+   double lotStep =
+      MarketInfo(
+         Symbol(),
+         MODE_LOTSTEP
+      );
+
+
+   if(lotStep <= 0)
+      lotStep = 0.01;
+
+
+   lots =
+      MathFloor(
+         lots / lotStep
+      ) *
+      lotStep;
+
+
+   lots =
+      MathMax(
+         minLot,
+         lots
+      );
+
+
+   lots =
+      MathMin(
+         maxLot,
+         lots
+      );
+
+
+   int lotDigits = 2;
+
+
+   if(lotStep >= 1.0)
+      lotDigits = 0;
+
+   else
+   if(lotStep >= 0.1)
+      lotDigits = 1;
+
+
+   return(
+      NormalizeDouble(
+         lots,
+         lotDigits
+      )
+   );
+}
+
+
+//==================================================================
+// FIX 5 - OPEN TRADE
+//==================================================================
+
+void OpenTrade()
+{
+   if(PositionExists())
+   {
+      if(DebugMode)
+         Print(
+            "OpenTrade blocked: position already exists"
+         );
+
+      return;
+   }
+
+
+   RefreshRates();
+
+
+   double atr =
+      iATR(
+         Symbol(),
+         PERIOD_M1,
+         ATRPeriod,
+         1
+      );
+
+
+   if(atr <= 0)
+      atr = ATR_M15;
+
+
+   if(atr <= 0)
+   {
+      Print(
+         "OpenTrade failed: ATR unavailable"
+      );
+
+      return;
+   }
+
+
+   double slDistance =
+      MathMax(
+         atr * ATR_SL_Multiplier,
+         MinimumSLPoints * Point
+      );
+
+
+   double tpDistance =
+      MathMax(
+         atr * ATR_TP_Multiplier,
+         MinimumTPPoints * Point
+      );
+
+
+   int stopLevel =
+      (int)MarketInfo(
+         Symbol(),
+         MODE_STOPLEVEL
+      );
+
+
+   double minStop =
+      (stopLevel + 2) * Point;
+
+
+   slDistance =
+      MathMax(
+         slDistance,
+         minStop
+      );
+
+
+   tpDistance =
+      MathMax(
+         tpDistance,
+         minStop
+      );
+
+
+   double lots =
+      CalculateLot(
+         slDistance
+      );
+
+
+   if(lots <= 0)
+   {
+      Print(
+         "OpenTrade failed: calculated lots <= 0"
+      );
+
+      return;
+   }
+
+
+   int ticket = -1;
+
+   int type = -1;
+
+   double price = 0;
+   double sl = 0;
+   double tp = 0;
+
+
+   if(IsM1Bull)
+   {
+      type = OP_BUY;
+
+      price = Ask;
+
+      sl =
+         NormalizeDouble(
+            price - slDistance,
+            Digits
+         );
+
+      tp =
+         NormalizeDouble(
+            price + tpDistance,
+            Digits
+         );
+   }
+
+   else
+   if(IsM1Bear)
+   {
+      type = OP_SELL;
+
+      price = Bid;
+
+      sl =
+         NormalizeDouble(
+            price + slDistance,
+            Digits
+         );
+
+      tp =
+         NormalizeDouble(
+            price - tpDistance,
+            Digits
+         );
+   }
+
+   else
+   {
+      return;
+   }
+
+
+   string commentText =
+      "T100 Trend Rider v5";
+
+
+   ResetLastError();
+
+
+   ticket =
+      OrderSend(
+         Symbol(),
+         type,
+         lots,
+         price,
+         10,
+         sl,
+         tp,
+         commentText,
+         MagicNumber,
+         0,
+         (type == OP_BUY ?
+          clrBlue :
+          clrRed)
+      );
+
+
+   if(ticket < 0)
+   {
+      int err =
+         GetLastError();
+
+
+      Print(
+         "ORDER SEND FAILED. Error=",
+         err,
+         " type=",
+         type,
+         " lots=",
+         DoubleToString(lots,2),
+         " price=",
+         DoubleToString(price,Digits),
+         " SL=",
+         DoubleToString(sl,Digits),
+         " TP=",
+         DoubleToString(tp,Digits)
+      );
+
+
+      return;
+   }
+
+
+   TradesToday++;
+
+
+   Print(
+      "===================================================="
+   );
+
+
+   Print(
+      "TRADE OPENED v5.10 ticket=",
+      ticket,
+      " direction=",
+      (
+         type == OP_BUY ?
+         "BUY" :
+         "SELL"
+      ),
+      " lots=",
+      DoubleToString(lots,2),
+      " score=",
+      DoubleToString(EntryScore,0),
+      " ATR=",
+      DoubleToString(atr,Digits)
+   );
+
+
+   Print(
+      "SL=",
+      DoubleToString(sl,Digits),
+      " TP=",
+      DoubleToString(tp,Digits)
+   );
+
+
+   Print(
+      "===================================================="
+   );
+}
+
+
+//==================================================================
+// FIX 6 - TRADE MANAGEMENT
+//==================================================================
+
+void ManageOpenTrades()
+{
+   RefreshRates();
+
+
+   double atr =
+      iATR(
+         Symbol(),
+         PERIOD_M1,
+         ATRPeriod,
+         0
+      );
+
+
+   if(atr <= 0)
+   {
+      atr =
+         iATR(
+            Symbol(),
+            PERIOD_M15,
+            ATRPeriod,
+            1
+         );
+   }
+
+
+   if(atr <= 0)
+      return;
+
+
+   for(
+      int i = OrdersTotal()-1;
+      i >= 0;
+      i--
+   )
+   {
+      if(
+         !OrderSelect(
+            i,
+            SELECT_BY_POS,
+            MODE_TRADES
+         )
+      )
+         continue;
+
+
+      if(
+         OrderSymbol() !=
+         Symbol()
+      )
+         continue;
+
+
+      if(
+         OrderMagicNumber() !=
+         MagicNumber
+      )
+         continue;
+
+
+      if(
+         OrderType() != OP_BUY &&
+         OrderType() != OP_SELL
+      )
+         continue;
+
+
+      double openPrice =
+         OrderOpenPrice();
+
+
+      double currentSL =
+         OrderStopLoss();
+
+
+      double newSL =
+         currentSL;
+
+
+      bool modify = false;
+
+
+      //============================================================
+      // BUY
+      //============================================================
+
+      if(OrderType() == OP_BUY)
+      {
+         double profitDistance =
+            Bid - openPrice;
+
+
+         // Break-even.
+         if(
+            UseBreakEven &&
+            profitDistance >=
+            atr * BreakEvenATR
+         )
+         {
+            double be =
+               openPrice +
+               BreakEvenPlusPoints * Point;
+
+
+            if(
+               currentSL < be
+            )
+            {
+               newSL = be;
+               modify = true;
+            }
+         }
+
+
+         // ATR trailing.
+         if(
+            UseTrailingStop &&
+            profitDistance >
+            atr * TrailingATR
+         )
+         {
+            double trail =
+               Bid -
+               atr * TrailingATR;
+
+
+            if(
+               trail > newSL &&
+               trail > openPrice
+            )
+            {
+               newSL = trail;
+               modify = true;
+            }
+         }
+
+
+         double maxAllowed =
+            Bid -
+            (
+               MarketInfo(
+                  Symbol(),
+                  MODE_STOPLEVEL
+               ) + 2
+            ) * Point;
+
+
+         if(newSL > maxAllowed)
+            newSL = maxAllowed;
+
+
+         if(
+            modify &&
+            newSL > currentSL &&
+            newSL < Bid
+         )
+         {
+            newSL =
+               NormalizeDouble(
+                  newSL,
+                  Digits
+               );
+
+
+            ResetLastError();
+
+
+            if(
+               !OrderModify(
+                  OrderTicket(),
+                  OrderOpenPrice(),
+                  newSL,
+                  OrderTakeProfit(),
+                  0,
+                  clrNONE
+               )
+            )
+            {
+               Print(
+                  "BUY OrderModify failed ticket=",
+                  OrderTicket(),
+                  " error=",
+                  GetLastError()
+               );
+            }
+         }
+      }
+
+
+      //============================================================
+      // SELL
+      //============================================================
+
+      else
+      if(OrderType() == OP_SELL)
+      {
+         double profitDistance =
+            openPrice - Ask;
+
+
+         // Break-even.
+         if(
+            UseBreakEven &&
+            profitDistance >=
+            atr * BreakEvenATR
+         )
+         {
+            double be =
+               openPrice -
+               BreakEvenPlusPoints * Point;
+
+
+            if(
+               currentSL == 0 ||
+               currentSL > be
+            )
+            {
+               newSL = be;
+               modify = true;
+            }
+         }
+
+
+         // ATR trailing.
+         if(
+            UseTrailingStop &&
+            profitDistance >
+            atr * TrailingATR
+         )
+         {
+            double trail =
+               Ask +
+               atr * TrailingATR;
+
+
+            if(
+               (
+                  newSL == 0 ||
+                  trail < newSL
+               ) &&
+               trail < openPrice
+            )
+            {
+               newSL = trail;
+               modify = true;
+            }
+         }
+
+
+         double minAllowed =
+            Ask +
+            (
+               MarketInfo(
+                  Symbol(),
+                  MODE_STOPLEVEL
+               ) + 2
+            ) * Point;
+
+
+         if(
+            newSL < minAllowed &&
+            newSL > 0
+         )
+         {
+            newSL = minAllowed;
+         }
+
+
+         if(
+            modify &&
+            (
+               currentSL == 0 ||
+               newSL < currentSL
+            ) &&
+            newSL > Ask
+         )
+         {
+            newSL =
+               NormalizeDouble(
+                  newSL,
+                  Digits
+               );
+
+
+            ResetLastError();
+
+
+            if(
+               !OrderModify(
+                  OrderTicket(),
+                  OrderOpenPrice(),
+                  newSL,
+                  OrderTakeProfit(),
+                  0,
+                  clrNONE
+               )
+            )
+            {
+               Print(
+                  "SELL OrderModify failed ticket=",
+                  OrderTicket(),
+                  " error=",
+                  GetLastError()
+               );
+            }
+         }
+      }
+   }
+}
+
+
+//==================================================================
+// DAILY COUNTERS
+//==================================================================
+
+void ResetDailyCounters()
+{
+   TradeDay =
+      TimeDayOfYear(
+         TimeCurrent()
+      );
+
+
+   DayStartBalance =
+      AccountBalance();
+
+
+   TradesToday = 0;
+}
+
+
+void UpdateDailyCounters()
+{
+   int today =
+      TimeDayOfYear(
+         TimeCurrent()
+      );
+
+
+   if(today != TradeDay)
+      ResetDailyCounters();
+}
+
+
+//==================================================================
+// STATUS
+//==================================================================
+
+void PrintStatus()
+{
+   Print(
+      "---------------- T100 v5 STATUS ----------------"
+   );
+
+
+   Print(
+      "Time=",
+      TimeToString(
+         TimeCurrent(),
+         TIME_DATE|TIME_SECONDS
+      ),
+      " TradingHoursOK=",
+      TradingHoursOK,
+      " SpreadOK=",
+      SpreadOK,
+      " Spread=",
+      DoubleToString(
+         CurrentSpread,
+         1
+      )
+   );
+
+
+   Print(
+      "H4 EMA20/50=",
+      DoubleToString(EMA20_H4,Digits),
+      " / ",
+      DoubleToString(EMA50_H4,Digits),
+
+      " H1=",
+      DoubleToString(EMA20_H1,Digits),
+      " / ",
+      DoubleToString(EMA50_H1,Digits)
+   );
+
+
+   Print(
+      "M15 EMA20/50=",
+      DoubleToString(EMA20_M15,Digits),
+      " / ",
+      DoubleToString(EMA50_M15,Digits),
+
+      " M5=",
+      DoubleToString(EMA20_M5,Digits),
+      " / ",
+      DoubleToString(EMA50_M5,Digits),
+
+      " M1=",
+      DoubleToString(EMA20_M1,Digits),
+      " / ",
+      DoubleToString(EMA50_M1,Digits)
+   );
+
+
+   Print(
+      "M15 EMA20/50=",
+      DoubleToString(EMA20_M15,Digits),
+      " / ",
+      DoubleToString(EMA50_M15,Digits),
+
+      " RSI=",
+      DoubleToString(RSI_M15,2),
+
+      " ATR=",
+      DoubleToString(ATR_M15,Digits),
+
+      " ADX=",
+      DoubleToString(ADX_M15,2),
+
+      " Vol=",
+      Volume_M15
+   );
+
+
+   Print(
+      "Daily trades=",
+      TradesToday,
+
+      " DayStartBalance=",
+      DoubleToString(DayStartBalance,2),
+
+      " Equity=",
+      DoubleToString(AccountEquity(),2)
+   );
+
+
+   Print(
+      "Trend: H4Bull=",
+      IsH4Bull,
+      " H1Bull=",
+      IsH1Bull,
+      " M15Bull=",
+      IsM15Bull,
+      " M5Bull=",
+      IsM5Bull,
+      " | H4Bear=",
+      IsH4Bear,
+      " H1Bear=",
+      IsH1Bear,
+      " M15Bear=",
+      IsM15Bear,
+      " M5Bear=",
+      IsM5Bear
+   );
+
+
+   Print(
+      "Sequence: BullPullbackAge=",
+      BullPullbackAge,
+      " BearPullbackAge=",
+      BearPullbackAge,
+      " BullCross=",
+      BullCross(),
+      " BearCross=",
+      BearCross(),
+      " PullbackMaxBars=",
+      PullbackMaxBars
+   );
+
+
+   Print(
+      "-------------------------------------------------"
+   );
+}
+
+
+//+------------------------------------------------------------------+
+//| END OF T100 TREND RIDER v5.10                                   |
+//+------------------------------------------------------------------+
